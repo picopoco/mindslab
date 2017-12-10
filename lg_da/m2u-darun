@@ -1,0 +1,271 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import subprocess
+import argparse
+import socket
+from time import sleep
+import grpc
+import uuid
+import sys
+
+import traceback
+from common.config import Config
+from maum.m2u.facade import dialog_pb2
+from maum.m2u.da import provider_pb2 as provider
+from maum.m2u.da.v1 import talk_pb2 as talk_v1
+from maum.m2u.da.v2 import talk_pb2 as talk_v2
+from maum.m2u.server import pool_pb2 as pool
+from google.protobuf import empty_pb2
+
+
+class DialogAgentRunner(object):
+    version = '0.8'
+    exec_cmd = []
+    respawn = False
+
+    chatbot = ''
+    skill = ''
+
+    conf = Config()
+    child_pid = 0
+    pipe = None
+    res_key = None
+    da_spec = None
+
+    def __init__(self):
+        pass
+
+    def set_exec(self, exec_cmd):
+        self.exec_cmd = exec_cmd
+
+    def set_respawn(self, respawn):
+        self.respawn = respawn
+
+    def set_skill(self, skill):
+        self.skill = skill
+
+    def set_chatbot(self, chatbot):
+        self.chatbot = chatbot
+
+    def set_da_spec(self, da_spec):
+        if da_spec == 'v1':
+            self.da_spec = provider.DAP_SPEC_V_1
+        elif da_spec == 'v2':
+            self.da_spec = provider.DAP_SPEC_V_2
+        else:
+            self.da_spec = provider.DAP_SPEC_UNSPECIFIED
+
+    def do_run_forever(self):
+        pass
+
+    def run(self):
+        if self.respawn:
+            self.do_run_forever()
+        else:
+            self.do_run()
+
+    @staticmethod
+    def get_local_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 53))
+        # print(s.getsockname()[0])
+        ret = s.getsockname()[0]
+        s.close()
+        return ret
+
+    def do_run(self):
+        cmd = self.exec_cmd
+        port = find_unused_port()
+        cmd.append('-p')
+        cmd.append(str(port))
+
+        self.pipe = subprocess.Popen(cmd, close_fds=True,
+                                     stdout=sys.stdout,
+                                     stderr=sys.stderr)
+        if not self.pipe.pid > 0:
+            print '>>>', 'Cannot exec cmd', self.exec_cmd
+            exit(1)
+
+        # TODO(gih2yun): change to admin server..
+        admin_export = self.conf.get('admin.export')
+
+        print '>>>', 'admin endpoint', admin_export
+        pool_stub = pool.DialogAgentInstancePoolStub(
+            grpc.insecure_channel(admin_export))
+
+        try:
+            sleep(2)
+            child_addr = '127.0.0.1:' + str(port)
+            child_channel = grpc.insecure_channel(child_addr)
+
+            if self.da_spec == provider.DAP_SPEC_V_1:
+                dainst_stub = talk_v1.DialogAgentProviderStub(child_channel)
+            elif self.da_spec == provider.DAP_SPEC_V_2:
+                dainst_stub = talk_v2.DialogAgentProviderStub(child_channel)
+            else:
+                dainst_stub = talk_v1.DialogAgentProviderStub(child_channel)
+
+            empty_obj = empty_pb2.Empty()
+            status = dainst_stub.IsReady(empty_obj)
+            if status.state != provider.DIAG_STATE_IDLE:
+                print '>>>', 'invalid state ', status.state, self.pipe.pid
+                self.pipe.terminate()
+                exit(1)
+            print '>>>', "is ready done!"
+
+            for skill in self.skill:
+                # GET RUNTIME Parameter
+                run_params = dainst_stub.GetRuntimeParameters(empty_obj)
+                print '>>>', "get runtime parameter done!"
+                # Init
+                init_param = provider.InitParameter()
+                init_param.chatbot = self.chatbot
+                init_param.skill = skill
+                init_param.lang = dialog_pb2.kor
+
+                init_param.sds_remote_addr = \
+                    self.conf.get('sds-svcd.export.ip') + ':' + \
+                    self.conf.get('sds-svcd.export.port')
+
+                for p in run_params.params:
+                    init_param.params[p.name] = p.default_value
+                    print '>>>', p.name, p.default_value, init_param.params
+
+                res = dainst_stub.Init(init_param)
+                print '>>>', "init done!"
+                # DA RES
+
+                dares = pool.DialogAgentInstanceResource()
+                dares.name = 'darun-' + res.name + '-' + str(port)
+                dares.description = res.description
+                dares.version = res.version
+                dares.da_spec = self.da_spec
+                dares.chatbot = self.chatbot
+                dares.skill = skill
+                dares.lang = dialog_pb2.kor
+                # random uuid를 생성한다.
+                dares.key = str(uuid.uuid1())
+                dares.server_ip = DialogAgentRunner.get_local_ip()
+                dares.server_port = port
+
+                dares.launch_type = pool.DAL_DARUN
+                dares.launcher = 'darun ' + self.version
+                dares.pid = self.pipe.pid
+                dares.started_at.GetCurrentTime()
+                dares.param.CopyFrom(res)
+                self.res_key = pool_stub.Register(dares)
+                print ">>> register done!", self.res_key, dares.da_spec
+
+            # p = select.poll()
+            # p.register(self.pipe.stderr)
+            # p.register(self.pipe.stdout)
+            #
+            # while self.pipe.poll() is None:
+            #     try:
+            #         r = p.poll(1)
+            #     except select.error, err:
+            #         if err.args[0] != socket.EINTR:
+            #             raise
+            #         r = []
+            #     for fd, flags in r:
+            #         print fd
+            #         if fd == self.pipe.stderr.fileno():
+            #             print 'E ', self.pipe.stderr.readline()
+            #         if fd == self.pipe.stdout.fileno():
+            #             print 'O ', self.pipe.stdout.readline()
+            #     sleep(0.5)
+
+            self.pipe.wait()
+
+            print '>>>', 'Child process exit with', self.pipe.returncode
+            self.stop()
+        except KeyboardInterrupt:
+            print '>>>', 'Exit'
+            self.stop()
+        except grpc.RpcError as e:
+            print '>>>', e.__doc__
+            print '>>>', e.message
+            print '>>>', traceback.format_exc()
+            self.stop()
+        except Exception as e:
+            print '>>>', e.__doc__
+            print '>>>', e.message
+            print '>>>', traceback.format_exc()
+            self.stop()
+
+    def stop(self):
+        if self.pipe is not None:
+            admin_endpoint  = self.conf.get('admin.export')
+            pool_stub = pool.DialogAgentInstancePoolStub(
+                grpc.insecure_channel(admin_endpoint))
+
+            dares_key = pool.DialogAgentInstanceKey()
+            dares_key.key = self.res_key.key
+            stat = pool_stub.Unregister(dares_key)
+            print stat
+            self.pipe.terminate()
+
+
+def find_unused_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('', 0))
+    addr, port = s.getsockname()
+    # print 'find unused port', addr, port
+    s.close()
+    return port
+
+
+def run_cmd():
+    conf = Config()
+    conf.init('m2u.conf') # for prod
+    # conf.init('/srv/minds/etc/m2u.conf') # for debug
+
+    parser = argparse.ArgumentParser(
+        description='DA runner')
+    parser.add_argument('cmd',
+                        nargs='+',
+                        help='Exeutable command')
+    parser.add_argument('-c', '--chatbot',
+                        nargs='?',
+                        dest='chatbot',
+                        required=True,
+                        help='Specify Chatbot to run')
+    parser.add_argument('-s', '--skill',
+                        nargs='*',
+                        dest='skill',
+                        required=True,
+                        help='Skill in chatbot')
+    parser.add_argument('-r', '--respawn',
+                        nargs='?',
+                        dest='respawn',
+                        required=False,
+                        help='Enable respawn')
+    parser.add_argument('-v', '--version',
+                        nargs='?',
+                        dest='da_spec',
+                        required=False,
+                        default=provider.DAP_SPEC_UNSPECIFIED,
+                        help='define da spec')
+
+    args = parser.parse_args()
+
+    print args.cmd
+
+    runner = DialogAgentRunner()
+    runner.set_exec(args.cmd)
+    runner.set_chatbot(args.chatbot)
+    runner.set_skill(args.skill)
+    runner.set_da_spec(args.da_spec)
+
+    # runner.set_respawn(args.respawn)
+    runner.set_respawn(False)
+
+    try:
+        runner.run()
+    except KeyboardInterrupt:
+        runner.stop()
+
+
+if __name__ == '__main__':
+    run_cmd()

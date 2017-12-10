@@ -1,0 +1,243 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import subprocess
+import argparse
+import socket
+from time import sleep
+import grpc
+import uuid
+import sys
+import os
+# import select
+import traceback
+
+exe_path = os.path.realpath(sys.argv[0])
+bin_path = os.path.dirname(exe_path)
+lib_path = os.path.realpath(bin_path + '/../lib/python')
+sys.path.append(lib_path)
+
+from common.config import Config
+from elsa.facade import dialog_pb2
+from minds.maum.da import provider_pb2 as provider
+from minds.maum.server import pool_pb2 as pool
+from google.protobuf import empty_pb2
+
+
+class DialogAgentRunner(object):
+    exec_cmd = []
+    respawn = False
+
+    svcgroup = ''
+    domain = ''
+
+    conf = Config()
+    child_pid = 0
+    
+    def __init__(self):
+        pass
+
+    def set_exec(self, exec_cmd):
+        self.exec_cmd = exec_cmd
+
+    def set_respawn(self, respawn):
+        self.respawn = respawn
+
+    def set_domain(self, domain):
+        self.domain = domain
+
+    def set_svc_group(self, svcgroup):
+        self.svcgroup = svcgroup
+
+    def run(self):
+        if self.respawn:
+            self.do_run_forever()
+        else:
+            self.do_run()
+
+    @staticmethod
+    def find_unused_port():
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('', 0))
+        addr, port = s.getsockname()
+        print 'find unused port', addr, port
+        s.close()
+        return port
+
+    @staticmethod
+    def get_local_ip():
+        ret = ''
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 53))
+        print(s.getsockname()[0])
+        ret = s.getsockname()[0]
+        s.close()
+        return ret
+
+    def do_run(self):
+        cmd = self.exec_cmd
+        port = DialogAgentRunner.find_unused_port()
+        cmd.append('-p')
+        cmd.append(str(port))
+
+        self.pipe = subprocess.Popen(cmd, close_fds=True,
+                                     stdout=sys.stdout,
+                                     stderr=sys.stderr)
+        if not self.pipe.pid > 0:
+            print '>>>', 'Cannot exec cmd', self.exec_cmd
+            exit(1)
+
+        maum_addr = self.conf.get('maumd.export.ip') + ':' + \
+                    self.conf.get('maumd.export.port')
+        print '>>>', 'maum addr', maum_addr
+        maum_stub = pool.DialogAgentPoolStub(grpc.insecure_channel(maum_addr))
+
+        try:
+            sleep(2)
+            child_addr = '127.0.0.1:' + str(port)
+            child_channel = grpc.insecure_channel(child_addr)
+            dap_stub = provider.DialogAgentProviderStub(child_channel)
+
+            empty_obj = empty_pb2.Empty()
+            status = dap_stub.IsReady(empty_obj)
+            if status.state != provider.DIAG_STATE_IDLE:
+                print '>>>', 'invalid state ', status.state, self.pipe.pid
+                self.pipe.terminate()
+                exit(1)
+            print '>>>', "is ready done!"
+
+            # GET RUNTIME Parameter
+            run_params = dap_stub.GetRuntimeParameters(empty_obj)
+            print '>>>', "get runtime parameter done!"
+            
+            # Init
+            init_param = provider.InitParameter()
+            init_param.svc_group = self.svcgroup
+            init_param.domain = self.domain
+            init_param.lang = 0
+
+            init_param.sds_remote_addr = \
+                self.conf.get('sds-svcd.export.ip') + ':' + \
+                self.conf.get('sds-svcd.export.port')
+
+
+            for p in run_params.params:
+                init_param.params[p.name] = p.default_value
+                print '>>>', p.name, p.default_value, init_param.params
+                print 'for'
+
+            res = dap_stub.Init(init_param)
+            print '>>>', "init done!"
+            # DA RES
+            dares = pool.DialogAgentResource()
+            dares.name = 'darun-' + res.name + '-' + str(port)
+            dares.description = res.description
+            dares.version = res.version
+            dares.svc_group = self.svcgroup
+            dares.domain = self.domain
+            dares.lang = dialog_pb2.eng
+            # random uuid를 생성한다.
+            dares.key = str(uuid.uuid1())
+            dares.server_ip = DialogAgentRunner.get_local_ip()
+            dares.server_port = str(port)
+
+            dares.param.CopyFrom(res)
+            self.res_key = maum_stub.Register(dares)
+            print ">>> register done!", self.res_key
+
+            # p = select.poll()
+            # p.register(self.pipe.stderr)
+            # p.register(self.pipe.stdout)
+            #
+            # while self.pipe.poll() is None:
+            #     try:
+            #         r = p.poll(1)
+            #     except select.error, err:
+            #         if err.args[0] != socket.EINTR:
+            #             raise
+            #         r = []
+            #     for fd, flags in r:
+            #         print fd
+            #         if fd == self.pipe.stderr.fileno():
+            #             print 'E ', self.pipe.stderr.readline()
+            #         if fd == self.pipe.stdout.fileno():
+            #             print 'O ', self.pipe.stdout.readline()
+            #     sleep(0.5)
+
+            self.pipe.wait()
+
+            print '>>>', 'Child process exit with', self.pipe.returncode
+            self.stop()
+        except KeyboardInterrupt:
+            print '>>>', 'Exit'
+            self.stop()
+        except grpc.RpcError as e:
+            print '>>>', e.__doc__
+            print '>>>', e.message
+            print '>>>', traceback.format_exc()
+            self.stop()
+        except Exception as e:
+            print '>>>', e.__doc__
+            print '>>>', e.message
+            print '>>>', traceback.format_exc()
+            self.stop()
+
+    def stop(self):
+        if self.pipe is not None:
+            maum_addr = self.conf.get('maumd.export.ip') + ':' + \
+                        self.conf.get('maumd.export.port')
+            maum_stub = pool.DialogAgentPoolStub(
+                grpc.insecure_channel(maum_addr))
+
+            dares_key = pool.DialogAgentResourceKey()
+            dares_key.key = self.res_key.key
+            stat = maum_stub.Unregister(dares_key)
+            print stat
+            self.pipe.terminate()
+
+
+def run_cmd():
+    conf = Config()
+    conf.init('maum.conf')
+
+    parser = argparse.ArgumentParser(
+        description='DA runner')
+    parser.add_argument('cmd',
+                        nargs='+',
+                        help='Exeutable command')
+    parser.add_argument('-s', '--svcgroup',
+                        nargs='?',
+                        dest='svcgroup',
+                        required=True,
+                        help='Service group')
+    parser.add_argument('-d', '--domain',
+                        nargs='?',
+                        dest='domain',
+                        required=True,
+                        help='Service group domain')
+    parser.add_argument('-r', '--respawn',
+                        nargs='?',
+                        dest='respawn',
+                        required=False,
+                        help='Enable respawn')
+
+    args = parser.parse_args()
+
+    print args.cmd
+
+    runner = DialogAgentRunner()
+    runner.set_exec(args.cmd)
+    runner.set_svc_group(args.svcgroup)
+    runner.set_domain(args.domain)
+
+    # runner.set_respawn(args.respawn)
+    runner.set_respawn(False)
+
+    try:
+        runner.run()
+    except KeyboardInterrupt:
+        runner.stop()
+
+
+if __name__ == '__main__':
+    run_cmd()
